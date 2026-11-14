@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/sonificator",
-    "crates/video-music-test",
+    "sonificator",
+    "sonificator-render",
 ]
 resolver = "2"

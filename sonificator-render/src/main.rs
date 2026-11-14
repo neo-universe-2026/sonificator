@@ -11,8 +11,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().filter(|arg| arg != "\\").collect();
     if args.len() < 2 || args.len() > 3 {
         eprintln!(
-            "usage: cargo run -p video-music-test -- <video.mp4> [output.wav]\n\
-             default output: video-music-test.wav"
+            "usage: cargo run -p sonificator-render -- <video.mp4> [output.wav]\n\
+             default output: sonificator-render.wav"
         );
         std::process::exit(2);
     }
@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = args
         .get(2)
         .map(String::as_str)
-        .unwrap_or("video-music-test.wav");
+        .unwrap_or("sonificator-render.wav");
     let (width, height, fps) = video_info(input)?;
     let frame_size = width as usize * height as usize * 4;
     let frames_per_audio_block = DEFAULT_SAMPLE_RATE as f64 / fps;
