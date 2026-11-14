@@ -1,11 +1,6 @@
-[package]
-name = "sonificator"
-version = "0.1.0"
-edition = "2024"
-
-[lib]
-name = "sonificator"
-path = "src/lib.rs"
-
-[dependencies]
-tunes = "1.1.0"
+[workspace]
+members = [
+    "crates/sonificator",
+    "crates/video-music-test",
+]
+resolver = "2"
