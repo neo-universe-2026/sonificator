@@ -2,7 +2,7 @@ use sonificator::Sonificator;
 
 fn main() {
     let mut sonificator = Sonificator::new(48_000);
-    let frame = vec![96u8, 156, 224, 255].repeat(64 * 64);
+    let frame = [96u8, 156, 224, 255].repeat(64 * 64);
     sonificator.push_frame(&frame, 64, 64);
     let audio = sonificator.render(480);
     println!(
