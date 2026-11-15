@@ -2,12 +2,12 @@
 
 **Sonificator** is a Rust audio engine that turns visual features extracted from video frames into continuously generated stereo music. It is the audio-generation core of the Neo Universe / Earth Information Jukebox project.
 
-The current implementation is a focused prototype for a CO₂ globe visualisation whose emissions appear as orange particles. It detects those visual patterns and maps selected features to musical behaviour. It is not yet a general-purpose scientific sonification framework.
+The current implementation is video-independent: it auto-detects visual pulses from general frame brightness regardless of color, and exposes extra image statistics such as hue, saturation, contrast and motion. Tunables in `AnalysisOptions` let you blend in chromatic salience or focus on a hue band when a dataset calls for it. It is still a prototype rather than a general-purpose scientific sonification framework.
 
 ## What it does
 
 1. Accepts 8-bit RGBA video frames.
-2. Samples each frame to estimate the level, centre position and spatial spread of orange regions.
+2. Samples each frame to estimate pulse strength (brightness-driven by default, color-agnostic), centre position, spatial spread, plus image stats: brightness, contrast, saturation, hue, warmth and inter-frame motion.
 3. Smooths those features over time.
 4. Generates interleaved stereo PCM audio using synthesised tones and a pentatonic musical vocabulary.
 
@@ -52,8 +52,9 @@ If no output path is supplied, the renderer writes sonificator-render.wav, or so
 
 ## Library quick start
 
-    use sonificator::Sonificator;
+    use sonificator::{Sonificator, AnalysisOptions};
 
+    // Defaults are color-agnostic: pulses come from general frame brightness.
     let mut engine = Sonificator::new(48_000);
 
     // rgba contains width * height * 4 bytes in RGBA order.
@@ -64,13 +65,25 @@ If no output path is supplied, the renderer writes sonificator-render.wav, or so
 
 Each call to render(n) returns 2 * n floating-point samples. Values are bounded to the normalised audio range. For a realtime callback, render_into provides an allocation-free rendering path when the caller supplies an appropriately sized output buffer.
 
+### Analysis options
+
+`AnalysisOptions` tunes how frames become features. Pass it to `Sonificator::new_with_options` or `set_analysis_options`:
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `color_weight` | 0.25 | Blend of brightness vs chromatic salience in the pulse. 0.0 = brightness only, 1.0 = legacy color-only behaviour. |
+| `hue_focus` | `None` | Optional `(center, half_width)` hue band in 0..=1 to emphasize (e.g. `Some((0.08, 0.1))` targets orange). |
+| `hue_focus_strength` | 1.0 | How strongly non-focused hues are suppressed, 0.0 to 1.0. |
+| `sensitivity` | 1.0 | Pulse gain before normalization, clamped to 0.25..=4.0 — useful for very dim or very flat videos. |
+
+`analyze_frame` / `analyze_frame_with` expose the same analysis without generating audio.
+
 See [the audio mapping notes](docs/audio-mapping.md) and [architecture notes](docs/architecture.md) for implementation details and limitations.
 
 ## Current scope and limitations
 
-- The frame analyser is deliberately tuned to orange emissions in a particular CO₂ visualisation style. It should not be assumed to interpret arbitrary NASA datasets correctly.
-- pulse_x currently influences musical fingerprinting, melody pitch and stereo placement. Orange pulse intensity influences rhythmic energy, tempo and dynamics.
-- Vertical position and spatial dispersion are measured and exposed as features, but are not yet mapped to distinct musical controls in the synthesiser.
+- The analyser is palette-agnostic by default: it responds to general brightness and motion on any video, not only to a single hue. It does not interpret data semantics; a bright region means visual brightness, not necessarily a higher concentration of anything.
+- `pulse_x` influences musical fingerprinting, melody pitch and stereo placement. Pulse strength influences rhythmic energy, tempo and dynamics; brightness and saturation shape the mix and timbre; hue seeds the musical fingerprint; motion drives tempo.
 - The engine describes visual patterns in sound; it does not calculate or validate atmospheric CO₂ concentrations.
 - Audio generation is implemented here. Browser playback is demonstrated separately in [Sonificator Studio](https://github.com/neo-universe-2026/sonificator-website).
 
