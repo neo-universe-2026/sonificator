@@ -195,6 +195,31 @@ impl GrooveState {
     }
 }
 
+/// Sonification algorithm variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SonificationAlgorithm {
+    /// Syncopated 16th-note groove with bass, chord pad, melody, and arpeggiation.
+    #[default]
+    RhythmicGroove,
+    /// Ambient melodic flow with walking basslines, modal chord washes, and flowing contour arpeggios.
+    MelodicContour,
+}
+
+const ASCENDING_RUN: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 5, 6, 7, 6, 5, 4, 3, 2];
+const DESCENDING_RUN: [usize; 16] = [3, 2, 1, 0, 2, 1, 0, 1, 3, 2, 1, 0, 1, 2, 1, 0];
+const ARCH_CONTOUR: [usize; 16] = [0, 2, 4, 6, 7, 6, 4, 2, 1, 3, 5, 6, 5, 3, 2, 1];
+const WAVE_CONTOUR: [usize; 16] = [0, 2, 1, 3, 2, 4, 3, 5, 4, 6, 5, 7, 6, 4, 2, 1];
+const CALL_RESPONSE: [usize; 16] = [2, 4, 5, 4, 2, 0, 2, 4, 5, 7, 5, 4, 2, 0, 1, 2];
+const ARP_RUN: [usize; 16] = [0, 2, 4, 7, 9, 11, 12, 14, 12, 11, 9, 7, 4, 2, 1, 0];
+
+#[inline]
+fn pentatonic_freq(deg: usize, scale: &[f32], key_ratio: f32) -> f32 {
+    let scale_len = scale.len().max(1);
+    let octave = (deg / scale_len) as i32;
+    let note = deg % scale_len;
+    scale[note] * (2.0f32).powi(octave) * key_ratio
+}
+
 /// Stateful frame-to-music renderer.
 #[derive(Debug, Clone)]
 pub struct Sonificator {
@@ -204,7 +229,9 @@ pub struct Sonificator {
     phase: [f32; 12],
     beat: f32,
     key_ratio: f32,
+    target_key_ratio: f32,
     progression: [usize; 4],
+    target_progression: [usize; 4],
     fingerprinted: bool,
     pulse_attack: f32,
     pulse_level: f32,
@@ -214,6 +241,20 @@ pub struct Sonificator {
     motion_energy: f32,
     target_warmth: f32,
     warmth: f32,
+
+    algorithm: SonificationAlgorithm,
+
+    // R3 Flash thump voice
+    thump_phase: f32,
+    thump_amp: f32,
+    thump_pitch_env: f32,
+
+    // R4 Envelope and bloom slew filters
+    bass_env_smooth: f32,
+    pad_env_smooth: f32,
+    melody_env_smooth: f32,
+    arp_env_smooth: f32,
+    current_bloom: f32,
 
     last_step_16th: usize,
     latched_pulse_x: f32,
@@ -241,7 +282,9 @@ impl Sonificator {
             phase: [0.0; 12],
             beat: 0.0,
             key_ratio: 1.0,
+            target_key_ratio: 1.0,
             progression: [0, 3, 4, 0],
+            target_progression: [0, 3, 4, 0],
             fingerprinted: false,
             pulse_attack: 0.0,
             pulse_level: 0.0,
@@ -251,6 +294,18 @@ impl Sonificator {
             motion_energy: 0.0,
             target_warmth: 0.0,
             warmth: 0.0,
+
+            algorithm: SonificationAlgorithm::RhythmicGroove,
+
+            thump_phase: 0.0,
+            thump_amp: 0.0,
+            thump_pitch_env: 0.0,
+
+            bass_env_smooth: 0.0,
+            pad_env_smooth: 0.0,
+            melody_env_smooth: 0.0,
+            arp_env_smooth: 0.0,
+            current_bloom: 0.20,
 
             last_step_16th: usize::MAX,
             latched_pulse_x: 0.5,
@@ -276,6 +331,20 @@ impl Sonificator {
 
     pub fn features(&self) -> FrameFeatures {
         self.features
+    }
+
+    pub fn algorithm(&self) -> SonificationAlgorithm {
+        self.algorithm
+    }
+
+    pub fn set_algorithm(&mut self, algo: SonificationAlgorithm) {
+        self.algorithm = algo;
+    }
+
+    #[must_use]
+    pub fn with_algorithm(mut self, algo: SonificationAlgorithm) -> Self {
+        self.algorithm = algo;
+        self
     }
 
     pub fn push_frame(&mut self, rgba: &[u8], width: u32, height: u32) {
@@ -320,6 +389,18 @@ impl Sonificator {
                 next_target.pulse_y = my;
                 next_target.pulse_dispersion = ((vx + vy) / 0.5).sqrt().clamp(0.0, 1.0);
             }
+
+            // R3: Sudden flash / luma surge detection triggering real-time procedural sub-bass thump voice
+            let curr_mean_luma: f32 = rich.luma_grid.iter().sum::<f32>() / 16.0;
+            let prev_mean_luma: f32 = self.prev_luma_grid.iter().sum::<f32>() / 16.0;
+            let luma_rise = curr_mean_luma - prev_mean_luma;
+            let pulse_rise = next_target.orange_pulse - self.target.orange_pulse;
+            if luma_rise > 0.20 || pulse_rise > 0.25 {
+                let surge = luma_rise.max(pulse_rise).clamp(0.0, 1.0);
+                let target_amp = (0.20 * (surge * 2.0).min(1.0)).max(0.15);
+                self.thump_amp = self.thump_amp.max(target_amp);
+                self.thump_pitch_env = 1.0;
+            }
         } else {
             self.target_motion = 0.0;
         }
@@ -333,20 +414,23 @@ impl Sonificator {
         self.target = next_target;
         self.target_warmth = rich.warmth;
 
+        let color_seed = if rich.features.orange_pulse > 0.002 {
+            rich.hue_norm
+        } else {
+            0.5
+        };
+        let fingerprint = (self.target.pulse_x * 0.45 + color_seed * 0.55).clamp(0.0, 1.0);
+        let semitone = (fingerprint * 11.0).round() as i32 % 12;
+        self.target_key_ratio = 2.0f32.powf(semitone as f32 / 12.0);
+        self.target_progression = match (fingerprint * 3.0) as usize % 3 {
+            0 => [0, 3, 4, 0],
+            1 => [0, 4, 5, 3],
+            _ => [0, 2, 5, 3],
+        };
+
         if !self.fingerprinted && (self.target.orange_pulse > 0.002 || self.target_motion > 0.02) {
-            let color_seed = if rich.features.orange_pulse > 0.002 {
-                rich.hue_norm
-            } else {
-                0.5
-            };
-            let fingerprint = (self.target.pulse_x * 0.45 + color_seed * 0.55).clamp(0.0, 1.0);
-            let semitone = (fingerprint * 11.0).round() as i32 % 12;
-            self.key_ratio = 2.0f32.powf(semitone as f32 / 12.0);
-            self.progression = match (fingerprint * 3.0) as usize % 3 {
-                0 => [0, 3, 4, 0],
-                1 => [0, 4, 5, 3],
-                _ => [0, 2, 5, 3],
-            };
+            self.key_ratio = self.target_key_ratio;
+            self.progression = self.target_progression;
             self.fingerprinted = true;
         }
     }
@@ -360,12 +444,19 @@ impl Sonificator {
 
     /// Allocation-free variant for realtime callbacks.
     pub fn render_into(&mut self, output: &mut [f32]) {
+        const MASTER_GAIN: f32 = 0.58;
         const DENSITY_RANK: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
+        let slew_coeff = 1.0 - (-1.0 / (0.002 * self.sample_rate)).exp();
         let (stereo_frames, _) = output.as_chunks_mut::<2>();
+
         for pair in stereo_frames {
             self.features = smooth(self.features, self.target, 0.0025);
             self.motion_energy += (self.target_motion - self.motion_energy) * 0.0015;
             self.warmth += (self.target_warmth - self.warmth) * 0.0015;
+
+            // R4: Smooth musical theme glide across video scene changes without jarring key jumps
+            self.key_ratio += (self.target_key_ratio - self.key_ratio) * 0.0003;
+
             let pulse_response = if self.target.orange_pulse > self.pulse_level {
                 0.0008
             } else {
@@ -377,7 +468,10 @@ impl Sonificator {
             // Governs transitions between Sparse Drift (< 0.28), Flowing Groove (0.28..0.65), and Intense Climax (>= 0.65)
             let base_activity = pulse_gate * 0.72 + self.features.pulse_dispersion * 0.28;
             let activity = (base_activity + self.motion_energy * 0.22).clamp(0.0, 1.0);
-            let tempo = 68.0 + activity * 28.0;
+
+            // R2: Warmth-driven tempo modulation (warm slows down, cool speeds up)
+            let base_tempo = 72.0 + activity * 24.0;
+            let tempo = (base_tempo - self.warmth * 18.0).clamp(52.0, 116.0);
             let beats_per_sample = tempo / 60.0 / self.sample_rate;
 
             let step_16th = ((self.beat * 4.0) as usize) % 64;
@@ -393,6 +487,11 @@ impl Sonificator {
                 self.latched_activity = activity;
                 let groove_state = GrooveState::from_activity(self.latched_activity);
 
+                // Update progression at bar boundaries for seamless musical transitions
+                if step_16th == 0 {
+                    self.progression = self.target_progression;
+                }
+
                 let bar = (step_16th / 16) % self.progression.len();
                 let chord = self.progression[bar];
                 let step_in_bar = step_16th % 16;
@@ -401,68 +500,13 @@ impl Sonificator {
                 let root = scale[chord.min(scale.len() - 1)] * self.key_ratio * 0.5;
                 let fifth_harmonic = root * 1.5;
 
-                // Syncopated Bass on Root/Fifth
-                match groove_state {
-                    GrooveState::SparseDrift => {
-                        if step_in_bar == 0 {
-                            self.latched_bass_freq = root;
-                            self.latched_bass_gate = true;
-                        } else if step_in_bar == 8 {
-                            self.latched_bass_freq = fifth_harmonic;
-                            self.latched_bass_gate = true;
-                        } else {
-                            self.latched_bass_gate = false;
-                        }
-                    }
-                    GrooveState::FlowingGroove => match step_in_bar {
-                        0 | 10 => {
-                            self.latched_bass_freq = root;
-                            self.latched_bass_gate = true;
-                        }
-                        6 | 14 => {
-                            self.latched_bass_freq = fifth_harmonic;
-                            self.latched_bass_gate = true;
-                        }
-                        _ => {
-                            self.latched_bass_gate = false;
-                        }
-                    },
-                    GrooveState::IntenseClimax => match step_in_bar {
-                        0 | 6 | 8 => {
-                            self.latched_bass_freq = root;
-                            self.latched_bass_gate = true;
-                        }
-                        3 | 11 | 14 => {
-                            self.latched_bass_freq = fifth_harmonic;
-                            self.latched_bass_gate = true;
-                        }
-                        _ => {
-                            self.latched_bass_gate = false;
-                        }
-                    },
-                }
+                // Timbre overtone balances
+                let warmth_bias = (self.latched_warmth * 0.08).clamp(-0.08, 0.08);
+                self.latched_timbre_h2 =
+                    (0.18 + self.latched_pulse_y * 0.35 + warmth_bias).clamp(0.05, 0.65);
+                self.latched_timbre_h3 =
+                    (0.06 + self.latched_pulse_y * 0.30 - warmth_bias).clamp(0.02, 0.55);
 
-                // Chord Gating
-                self.latched_chord_gate = match groove_state {
-                    GrooveState::SparseDrift => 0.35 + self.latched_activity * 0.2,
-                    GrooveState::FlowingGroove => {
-                        if matches!(step_in_bar, 0 | 3 | 6 | 8 | 11 | 14) {
-                            0.65
-                        } else {
-                            0.15
-                        }
-                    }
-                    GrooveState::IntenseClimax => {
-                        if matches!(step_in_bar, 0 | 3 | 6 | 8 | 10 | 12 | 14) {
-                            0.85
-                        } else {
-                            0.05
-                        }
-                    }
-                };
-
-                // Melody: pulse_y shifts register (octave/fifth lifts) and overtone brightness,
-                // while spectral warmth blends warm 2nd harmonic vs cool crystalline 3rd harmonic.
                 let register_lift = if self.latched_pulse_y >= 0.65 {
                     2.0 // Octave lift
                 } else if self.latched_pulse_y >= 0.35 {
@@ -471,53 +515,172 @@ impl Sonificator {
                     1.0 // Base register
                 };
 
-                let warmth_bias = (self.latched_warmth * 0.08).clamp(-0.08, 0.08);
-                self.latched_timbre_h2 = (0.18 + self.latched_pulse_y * 0.35 + warmth_bias).clamp(0.05, 0.65);
-                self.latched_timbre_h3 = (0.06 + self.latched_pulse_y * 0.30 - warmth_bias).clamp(0.02, 0.55);
-
-                // Quantized pentatonic call-and-response motifs selected via step-latched pulse_x
-                // (never produces out-of-scale microtonal semitones against the chord pad).
-                const MOTIF_BANK: [[usize; 8]; 3] = [
-                    [0, 2, 1, 2, 4, 2, 1, 0],
-                    [0, 1, 3, 4, 3, 2, 1, 0],
-                    [2, 4, 3, 2, 1, 2, 4, 2],
-                ];
-                let motif_variant = ((self.latched_pulse_x * 2.99) as usize).min(2);
-                let phrase = MOTIF_BANK[motif_variant];
-                let melody_trigger = match groove_state {
-                    GrooveState::SparseDrift => matches!(step_in_bar, 0 | 6 | 10),
-                    GrooveState::FlowingGroove => matches!(step_in_bar, 0 | 3 | 6 | 8 | 11 | 14),
-                    GrooveState::IntenseClimax => {
-                        matches!(step_in_bar, 0 | 2 | 3 | 6 | 8 | 10 | 11 | 14)
-                    }
+                let base_deg = if self.latched_pulse_y >= 0.65 {
+                    5 // Upper scale degrees (1 octave lift)
+                } else if self.latched_pulse_y >= 0.35 {
+                    2 // Mid scale degrees
+                } else {
+                    0 // Low scale degrees
                 };
 
-                if melody_trigger {
-                    let step_idx = (step_in_bar / 2 + bar) % phrase.len();
-                    let note_deg = (phrase[step_idx] + chord) % scale.len();
-                    self.latched_melody_freq = scale[note_deg] * self.key_ratio * register_lift;
-                    self.latched_melody_gate = true;
+                // Directional run / phrase selection driven by pulse_y and pulse_x
+                let phrase = if self.latched_pulse_y >= 0.65 {
+                    &ASCENDING_RUN
+                } else if self.latched_pulse_y <= 0.35 {
+                    &DESCENDING_RUN
+                } else if self.latched_pulse_x <= 0.35 {
+                    &CALL_RESPONSE
+                } else if self.latched_pulse_x >= 0.65 {
+                    &WAVE_CONTOUR
                 } else {
-                    self.latched_melody_gate = false;
-                }
+                    &ARCH_CONTOUR
+                };
 
-                // Dispersion-Modulated Arpeggio Groove Density
-                let density_slots = (self.latched_pulse_dispersion * 16.0).floor() as usize;
-                let arp_trigger = DENSITY_RANK[step_in_bar] <= density_slots;
-                if arp_trigger {
-                    let arp_phrase = [0usize, 2, 4, 2, 1, 3, 4, 2];
-                    let arp_idx = (step_16th + chord + bar) % arp_phrase.len();
-                    let arp_deg = (arp_phrase[arp_idx] + chord) % scale.len();
-                    let octave_shift = 2.0
-                        * if self.latched_pulse_dispersion > 0.55 && step_in_bar % 2 == 1 {
-                            2.0
-                        } else {
-                            1.0
+                match self.algorithm {
+                    SonificationAlgorithm::RhythmicGroove => {
+                        // Syncopated Bass on Root/Fifth
+                        match groove_state {
+                            GrooveState::SparseDrift => {
+                                if step_in_bar == 0 {
+                                    self.latched_bass_freq = root;
+                                    self.latched_bass_gate = true;
+                                } else if step_in_bar == 8 {
+                                    self.latched_bass_freq = fifth_harmonic;
+                                    self.latched_bass_gate = true;
+                                } else {
+                                    self.latched_bass_gate = false;
+                                }
+                            }
+                            GrooveState::FlowingGroove => match step_in_bar {
+                                0 | 10 => {
+                                    self.latched_bass_freq = root;
+                                    self.latched_bass_gate = true;
+                                }
+                                6 | 14 => {
+                                    self.latched_bass_freq = fifth_harmonic;
+                                    self.latched_bass_gate = true;
+                                }
+                                _ => {
+                                    self.latched_bass_gate = false;
+                                }
+                            },
+                            GrooveState::IntenseClimax => match step_in_bar {
+                                0 | 6 | 8 => {
+                                    self.latched_bass_freq = root;
+                                    self.latched_bass_gate = true;
+                                }
+                                3 | 11 | 14 => {
+                                    self.latched_bass_freq = fifth_harmonic;
+                                    self.latched_bass_gate = true;
+                                }
+                                _ => {
+                                    self.latched_bass_gate = false;
+                                }
+                            },
+                        }
+
+                        // Chord Gating
+                        self.latched_chord_gate = match groove_state {
+                            GrooveState::SparseDrift => 0.35 + self.latched_activity * 0.2,
+                            GrooveState::FlowingGroove => {
+                                if matches!(step_in_bar, 0 | 3 | 6 | 8 | 11 | 14) {
+                                    0.65
+                                } else {
+                                    0.15
+                                }
+                            }
+                            GrooveState::IntenseClimax => {
+                                if matches!(step_in_bar, 0 | 3 | 6 | 8 | 10 | 12 | 14) {
+                                    0.85
+                                } else {
+                                    0.05
+                                }
+                            }
                         };
-                    self.latched_arp_freq = scale[arp_deg] * self.key_ratio * octave_shift;
-                    self.latched_arp_gate = true;
-                } else {
-                    self.latched_arp_gate = false;
+
+                        // R5: 16th-note phrase advancement across 2.5-octave scale (15 degrees)
+                        let melody_trigger = match groove_state {
+                            GrooveState::SparseDrift => matches!(step_in_bar, 0 | 6 | 10),
+                            GrooveState::FlowingGroove => {
+                                matches!(step_in_bar, 0 | 3 | 6 | 8 | 11 | 14)
+                            }
+                            GrooveState::IntenseClimax => {
+                                matches!(step_in_bar, 0 | 2 | 3 | 6 | 8 | 10 | 11 | 14)
+                            }
+                        };
+
+                        if melody_trigger {
+                            let step_idx = (step_in_bar + bar * 4) % 16;
+                            let note_deg = (phrase[step_idx] + chord + base_deg) % 15;
+                            self.latched_melody_freq =
+                                pentatonic_freq(note_deg, scale, self.key_ratio * register_lift);
+                            self.latched_melody_gate = true;
+                        } else {
+                            self.latched_melody_gate = false;
+                        }
+
+                        // Dispersion-Modulated Arpeggio Groove Density across multi-octave register
+                        let density_slots =
+                            (self.latched_pulse_dispersion * 16.0).floor() as usize;
+                        let arp_trigger = DENSITY_RANK[step_in_bar] <= density_slots;
+                        if arp_trigger {
+                            let arp_idx = (step_16th + chord * 2 + bar) % ARP_RUN.len();
+                            let arp_deg = (ARP_RUN[arp_idx] + chord) % 15;
+                            let octave_shift = if self.latched_pulse_dispersion > 0.55
+                                && step_in_bar % 2 == 1
+                            {
+                                1.5
+                            } else {
+                                1.0
+                            };
+                            self.latched_arp_freq =
+                                pentatonic_freq(arp_deg, scale, self.key_ratio * octave_shift);
+                            self.latched_arp_gate = true;
+                        } else {
+                            self.latched_arp_gate = false;
+                        }
+                    }
+                    SonificationAlgorithm::MelodicContour => {
+                        // Walking bassline moving through modal tones on 8th-note steps
+                        let bass_step = step_in_bar / 2;
+                        let walk_deg = (chord + bass_step) % 10;
+                        self.latched_bass_freq =
+                            pentatonic_freq(walk_deg, scale, self.key_ratio * 0.25);
+                        self.latched_bass_gate = true;
+
+                        // Sustained modal chord wash
+                        self.latched_chord_gate = 0.55 + self.latched_activity * 0.30;
+
+                        // Flowing melodic contour with singing phrasing
+                        let melody_trigger = match groove_state {
+                            GrooveState::SparseDrift => matches!(step_in_bar, 0 | 4 | 8 | 12),
+                            GrooveState::FlowingGroove => {
+                                matches!(step_in_bar, 0 | 2 | 4 | 6 | 8 | 10 | 12 | 14)
+                            }
+                            GrooveState::IntenseClimax => true,
+                        };
+                        if melody_trigger {
+                            let step_idx = (step_in_bar + bar * 4) % 16;
+                            let note_deg = (phrase[step_idx] + chord + base_deg) % 15;
+                            self.latched_melody_freq =
+                                pentatonic_freq(note_deg, scale, self.key_ratio * register_lift);
+                            self.latched_melody_gate = true;
+                        } else {
+                            self.latched_melody_gate = false;
+                        }
+
+                        // Continuous contour arpeggio
+                        let arp_phrase = if self.latched_pulse_y >= 0.5 {
+                            &ASCENDING_RUN
+                        } else {
+                            &DESCENDING_RUN
+                        };
+                        let arp_idx = (step_16th + bar * 3) % 16;
+                        let arp_deg = (arp_phrase[arp_idx] + chord + 2) % 15;
+                        self.latched_arp_freq =
+                            pentatonic_freq(arp_deg, scale, self.key_ratio);
+                        self.latched_arp_gate = true;
+                    }
                 }
             }
 
@@ -528,47 +691,71 @@ impl Sonificator {
             let third = scale[(chord + 2).min(scale.len() - 1)] * self.key_ratio * 0.5;
             let fifth = scale[(chord + 4).min(scale.len() - 1)] * self.key_ratio * 0.5;
 
+            // Target gating envelopes with algorithm-specific characteristics
+            let (bass_target, pad_target, melody_target, arp_target) = match self.algorithm {
+                SonificationAlgorithm::RhythmicGroove => (
+                    if self.latched_bass_gate { (-step_fract * 4.5).exp() } else { 0.0 },
+                    self.latched_chord_gate * (1.0 - step_fract * 0.3),
+                    if self.latched_melody_gate { (-step_fract * 3.5).exp() } else { 0.0 },
+                    if self.latched_arp_gate { (-step_fract * 6.0).exp() } else { 0.0 },
+                ),
+                SonificationAlgorithm::MelodicContour => (
+                    if self.latched_bass_gate { (-step_fract * 2.2).exp() } else { 0.0 },
+                    self.latched_chord_gate * (0.85 + 0.15 * (step_fract * TAU).cos()),
+                    if self.latched_melody_gate { (-step_fract * 2.2).exp() } else { 0.0 },
+                    if self.latched_arp_gate { (-step_fract * 3.5).exp() } else { 0.0 },
+                ),
+            };
+
+            // R4: 2ms one-pole slew filters eliminating clicks and pops
+            self.bass_env_smooth += (bass_target - self.bass_env_smooth) * slew_coeff;
+            self.pad_env_smooth += (pad_target - self.pad_env_smooth) * slew_coeff;
+            self.melody_env_smooth += (melody_target - self.melody_env_smooth) * slew_coeff;
+            self.arp_env_smooth += (arp_target - self.arp_env_smooth) * slew_coeff;
+
             let drone = sine(&mut self.phase[0], root * 0.5, self.sample_rate) * 0.02;
 
-            let bass_env = if self.latched_bass_gate {
-                (-step_fract * 4.5).exp()
-            } else {
-                0.0
-            };
             let bass = (sine(&mut self.phase[1], self.latched_bass_freq * 0.5, self.sample_rate)
                 + sine(&mut self.phase[10], self.latched_bass_freq, self.sample_rate) * 0.35)
-                * bass_env
-                * (0.08 + pulse_gate * 0.12);
+                * self.bass_env_smooth
+                * (0.07 + pulse_gate * 0.11);
 
-            let pad_envelope = self.latched_chord_gate * (1.0 - step_fract * 0.3);
             let pad = (sine(&mut self.phase[2], root * 2.0, self.sample_rate)
-                + sine(&mut self.phase[3], third * 2.0, self.sample_rate) * 0.65
-                + sine(&mut self.phase[4], fifth * 2.0, self.sample_rate) * 0.45)
-                * pad_envelope
-                * (0.03 + pulse_gate * 0.06);
+                + sine(&mut self.phase[3], third * 2.0, self.sample_rate) * 0.60
+                + sine(&mut self.phase[4], fifth * 2.0, self.sample_rate) * 0.40)
+                * self.pad_env_smooth
+                * (0.03 + pulse_gate * 0.055);
 
-            let melody_env = if self.latched_melody_gate {
-                (-step_fract * 3.5).exp()
-            } else {
-                0.0
-            };
             let melody = (sine(&mut self.phase[5], self.latched_melody_freq, self.sample_rate)
                 + sine(&mut self.phase[6], self.latched_melody_freq * 2.0, self.sample_rate)
                     * self.latched_timbre_h2
                 + sine(&mut self.phase[7], self.latched_melody_freq * 3.0, self.sample_rate)
                     * self.latched_timbre_h3)
-                * melody_env
-                * (0.06 + pulse_gate * 0.14);
+                * self.melody_env_smooth
+                * (0.05 + pulse_gate * 0.12);
 
-            let arp_env = if self.latched_arp_gate {
-                (-step_fract * 6.0).exp()
-            } else {
-                0.0
-            };
             let arpeggio = (sine(&mut self.phase[8], self.latched_arp_freq, self.sample_rate)
                 + sine(&mut self.phase[9], self.latched_arp_freq * 2.0, self.sample_rate) * 0.25)
-                * arp_env
-                * (0.02 + pulse_gate * 0.10);
+                * self.arp_env_smooth
+                * (0.02 + pulse_gate * 0.08);
+
+            // R3: Procedural sub-bass thump on flash/intensity surge
+            let thump = if self.thump_amp > 1e-4 {
+                let thump_freq = 42.0 + 68.0 * self.thump_pitch_env;
+                let pitch_decay = (-1.0 / (0.035 * self.sample_rate)).exp();
+                self.thump_pitch_env *= pitch_decay;
+
+                let raw_thump = (self.thump_phase * TAU).sin();
+                self.thump_phase = (self.thump_phase + thump_freq / self.sample_rate).fract();
+
+                let voice_sample = (1.2 * raw_thump).tanh() * 0.85 * self.thump_amp;
+                let amp_decay = (-1.0 / (0.280 * self.sample_rate)).exp();
+                self.thump_amp *= amp_decay;
+                voice_sample
+            } else {
+                self.thump_amp = 0.0;
+                0.0
+            };
 
             let pulse_accent = self
                 .features
@@ -576,8 +763,12 @@ impl Sonificator {
                 .max(pulse_gate)
                 .max(self.pulse_attack)
                 .clamp(0.0, 1.0);
-            let visual_bloom = (0.16 + pulse_gate * 0.84) * (0.7 + pulse_accent * 0.3);
-            let sample = (drone + bass + pad + melody + arpeggio) * visual_bloom;
+            let target_bloom = (0.16 + pulse_gate * 0.84) * (0.7 + pulse_accent * 0.3);
+            self.current_bloom += (target_bloom - self.current_bloom) * slew_coeff;
+            let visual_bloom = self.current_bloom;
+
+            // R1: Master gain scaling ensuring headroom >= 1.6 dBFS (peak <= 0.83) and zero clipping
+            let sample = (drone + bass + pad + melody + arpeggio + thump) * visual_bloom * MASTER_GAIN;
             let pan = (self.features.pulse_x * 2.0 - 1.0) * 0.18;
             pair[0] = (sample * (1.0 - pan)).clamp(-1.0, 1.0);
             pair[1] = (sample * (1.0 + pan)).clamp(-1.0, 1.0);
@@ -833,5 +1024,194 @@ mod tests {
         let audio = son.render(4096);
         let energy: f32 = audio.iter().map(|s| s.abs()).sum();
         assert!(energy > 1.0);
+    }
+
+    #[test]
+    fn r1_master_gain_headroom_and_clipping_prevention() {
+        let mut son = Sonificator::new(48_000);
+        // Feed high-intensity frame with strong pulse and motion
+        let intense_frame = [255u8, 120, 20, 255].repeat(4 * 4);
+        son.push_frame(&intense_frame, 4, 4);
+        // Trigger a flash surge to engage all polyphonic voices including sub-bass thump
+        let flash_frame = [255u8, 255, 255, 255].repeat(4 * 4);
+        son.push_frame(&flash_frame, 4, 4);
+
+        let audio = son.render(48_000);
+        let peak = audio.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len() as f32).sqrt();
+
+        // Must maintain headroom >= 1.6 dBFS (peak <= 0.83) and zero clipping
+        assert!(
+            peak <= 0.83,
+            "peak amplitude must not exceed 0.83 under full polyphony: peak={peak}"
+        );
+        assert!(peak > 0.05, "audio should be active: peak={peak}");
+        assert!(
+            rms < 0.35,
+            "RMS should remain at comfortable listening level: rms={rms}"
+        );
+        assert!(
+            audio.iter().all(|s| s.abs() < 1.0),
+            "no sample should hit digital clipping boundary at 1.0"
+        );
+    }
+
+    #[test]
+    fn r2_warmth_tempo_inverse_modulation() {
+        let mut warm = Sonificator::new(48_000);
+        let mut cool = Sonificator::new(48_000);
+
+        // Warm frame: pure high red/orange (warmth -> +1.0)
+        let warm_frame = [255u8, 60, 10, 255].repeat(4 * 4);
+        // Cool frame: pure high cyan/blue (warmth -> -1.0)
+        let cool_frame = [10u8, 120, 255, 255].repeat(4 * 4);
+
+        for _ in 0..5 {
+            warm.push_frame(&warm_frame, 4, 4);
+            cool.push_frame(&cool_frame, 4, 4);
+        }
+
+        assert!(warm.target_warmth > 0.3, "target_warmth should be positive for warm frame");
+        assert!(cool.target_warmth < -0.3, "target_warmth should be negative for cool frame");
+
+        // Render 2 seconds
+        warm.render(48_000 * 2);
+        cool.render(48_000 * 2);
+
+        assert!(warm.warmth > 0.3, "smoothed warmth should be positive for warm frame");
+        assert!(cool.warmth < -0.3, "smoothed warmth should be negative for cool frame");
+
+        // Warm slows down tempo, cool speeds up tempo.
+        // Over equal rendering duration, cool must advance more beats than warm.
+        assert!(
+            cool.beat > warm.beat,
+            "cool tempo must be faster than warm tempo: cool.beat={}, warm.beat={}",
+            cool.beat,
+            warm.beat
+        );
+    }
+
+    #[test]
+    fn r2_dual_algorithm_switching_and_distinction() {
+        let son_default = Sonificator::new(48_000);
+        assert_eq!(son_default.algorithm(), SonificationAlgorithm::RhythmicGroove);
+
+        let mut son_contour = Sonificator::new(48_000).with_algorithm(SonificationAlgorithm::MelodicContour);
+        assert_eq!(son_contour.algorithm(), SonificationAlgorithm::MelodicContour);
+
+        let mut son_groove = Sonificator::new(48_000);
+        let frame = [220u8, 100, 30, 255].repeat(4 * 4);
+        son_groove.push_frame(&frame, 4, 4);
+        son_contour.push_frame(&frame, 4, 4);
+
+        let audio_groove = son_groove.render(4800);
+        let audio_contour = son_contour.render(4800);
+
+        assert_eq!(audio_groove.len(), audio_contour.len());
+        let diff: f32 = audio_groove
+            .iter()
+            .zip(audio_contour.iter())
+            .map(|(g, c)| (g - c).abs())
+            .sum();
+        assert!(
+            diff > 0.5,
+            "MelodicContour and RhythmicGroove should produce distinct acoustic outputs: diff={diff}"
+        );
+
+        son_contour.set_algorithm(SonificationAlgorithm::RhythmicGroove);
+        assert_eq!(son_contour.algorithm(), SonificationAlgorithm::RhythmicGroove);
+    }
+
+    #[test]
+    fn r3_sudden_flash_thump_voice_and_rhythm_preservation() {
+        let mut son = Sonificator::new(48_000);
+        let dark_frame = [20u8, 20, 20, 255].repeat(4 * 4);
+        son.push_frame(&dark_frame, 4, 4);
+        son.render(1000);
+        assert_eq!(son.thump_amp, 0.0);
+
+        let beat_before = son.beat;
+
+        // Sudden lightning flash frame (Delta L > 0.20)
+        let flash_frame = [255u8, 255, 255, 255].repeat(4 * 4);
+        son.push_frame(&flash_frame, 4, 4);
+
+        assert!(
+            son.thump_amp > 0.15,
+            "sudden flash surge must trigger procedural thump voice: amp={}",
+            son.thump_amp
+        );
+
+        let audio = son.render(4800);
+        let max_amp = audio.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        assert!(max_amp > 0.05);
+
+        // Verify beat phase advanced smoothly without being reset or displaced
+        assert!(son.beat > beat_before);
+    }
+
+    #[test]
+    fn r4_smooth_mid_video_theme_transitions_no_clicks() {
+        let mut son = Sonificator::new(48_000);
+        let scene1 = [240u8, 100, 20, 255].repeat(4 * 4);
+        son.push_frame(&scene1, 4, 4);
+        let _ = son.render(4800);
+
+        // Abrupt scene change mid-video to cool blue
+        let scene2 = [10u8, 100, 240, 255].repeat(4 * 4);
+        son.push_frame(&scene2, 4, 4);
+        let audio_transition = son.render(4800);
+
+        // Check for click/pop discontinuities: sample-to-sample difference should be small
+        let max_sample_step = audio_transition
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            max_sample_step < 0.20,
+            "mid-video transition must not contain abrupt sample discontinuities or clicks: max_step={max_sample_step}"
+        );
+    }
+
+    #[test]
+    fn r5_multi_tone_density_and_directional_runs() {
+        let mut son_low = Sonificator::new(48_000);
+        let mut son_high = Sonificator::new(48_000);
+
+        let frame_low = FrameFeatures {
+            orange_pulse: 0.7,
+            pulse_x: 0.5,
+            pulse_y: 0.1, // Low -> descending run
+            pulse_dispersion: 0.4,
+        };
+        let frame_high = FrameFeatures {
+            orange_pulse: 0.7,
+            pulse_x: 0.5,
+            pulse_y: 0.9, // High -> ascending run
+            pulse_dispersion: 0.4,
+        };
+
+        son_low.target = frame_low;
+        son_low.features = frame_low;
+        son_high.target = frame_high;
+        son_high.features = frame_high;
+
+        let audio_low = son_low.render(48_000);
+        let audio_high = son_high.render(48_000);
+
+        assert_ne!(audio_low, audio_high);
+        let zcr_low = audio_low
+            .windows(2)
+            .filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0))
+            .count();
+        let zcr_high = audio_high
+            .windows(2)
+            .filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0))
+            .count();
+        assert!(
+            zcr_high > zcr_low,
+            "ascending high-y run should produce higher frequencies and zero crossing rate: high={zcr_high}, low={zcr_low}"
+        );
     }
 }
